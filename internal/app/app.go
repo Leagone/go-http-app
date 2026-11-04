@@ -1,0 +1,124 @@
+// Package app configures and runs application.
+package app
+
+import (
+    "context"
+    "fmt"
+    "os"
+    "os/signal"
+    "syscall"
+
+    "go-app/config"
+    "go-app/internal/controller/restapi"
+    persistTaskRepo "go-app/internal/repo/persistent/task"
+    persistTranslationRepo "go-app/internal/repo/persistent/translation"
+    persistUserRepo "go-app/internal/repo/persistent/user"
+    "go-app/internal/repo/webapi"
+    "go-app/internal/usecase"
+    "go-app/internal/usecase/task"
+    "go-app/internal/usecase/translation"
+    "go-app/internal/usecase/user"
+    "go-app/pkg/httpserver"
+    "go-app/pkg/jwt"
+    "go-app/pkg/logger"
+    "go-app/pkg/postgres"
+    "go-app/pkg/tracing"
+)
+
+type useCases struct {
+    translation usecase.Translation
+    user        usecase.User
+    task        usecase.Task
+}
+
+type servers struct {
+    http *httpserver.Server
+}
+
+func initUseCases(pg *postgres.Postgres, jwtManager *jwt.Manager) useCases {
+    translationRepo := persistTranslationRepo.New(pg)
+    taskRepo := persistTaskRepo.New(pg)
+    userRepo := persistUserRepo.New(pg)
+
+    return useCases{
+        user:        user.New(userRepo, jwtManager),
+        task:        task.New(taskRepo),
+        translation: translation.New(translationRepo, webapi.New()),
+    }
+}
+
+func initServers(cfg *config.Config, uc useCases, jwtManager *jwt.Manager, l logger.Interface) servers {
+    // HTTP Server
+    httpServer := httpserver.New(l, httpserver.Port(cfg.HTTP.Port), httpserver.Prefork(cfg.HTTP.UsePreforkMode))
+    restapi.NewRouter(httpServer.App, cfg, uc.translation, uc.user, uc.task, jwtManager, l)
+
+    return servers{
+        http: httpServer,
+    }
+}
+
+func (s *servers) startServers() {
+    s.http.Start()
+}
+
+func (s *servers) waitForShutdown(l logger.Interface) {
+    interrupt := make(chan os.Signal, 1)
+    signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
+
+    var err error
+
+    select {
+    case sig := <-interrupt:
+        l.Info("app - Run - signal: %s", sig.String())
+    case err = <-s.http.Notify():
+        l.Error(fmt.Errorf("app - Run - httpServer.Notify: %w", err))
+    }
+
+    s.shutdownServers(l)
+}
+
+func (s *servers) shutdownServers(l logger.Interface) {
+    if err := s.http.Shutdown(); err != nil {
+        l.Error(fmt.Errorf("app - Run - httpServer.Shutdown: %w", err))
+    }
+}
+
+// Run creates objects via constructors.
+func Run(cfg *config.Config) {
+    l := logger.New(cfg.Log.Level)
+
+    ctx := context.Background()
+
+    // Tracing
+    shutdownTracing, err := tracing.New(ctx, tracing.Config{
+        Enabled:     cfg.Tracing.Enabled,
+        ServiceName: cfg.App.Name,
+        Version:     cfg.App.Version,
+        Endpoint:    cfg.Tracing.OTLPEndpoint,
+        Insecure:    cfg.Tracing.OTLPInsecure,
+        SampleRate:  cfg.Tracing.SampleRate,
+    })
+    if err != nil {
+        l.Fatal(fmt.Errorf("app - Run - tracing.New: %w", err))
+    }
+    defer func() {
+        if err := shutdownTracing(ctx); err != nil {
+            l.Error(fmt.Errorf("app - Run - shutdownTracing: %w", err))
+        }
+    }()
+
+    // Repository
+    pg, err := postgres.New(cfg.PG.URL, postgres.MaxPoolSize(cfg.PG.PoolMax))
+    if err != nil {
+        l.Fatal(fmt.Errorf("app - Run - postgres.New: %w", err))
+    }
+    defer pg.Close()
+
+    // JWT
+    jwtManager := jwt.New(cfg.JWT.Secret, cfg.JWT.TokenExpiry)
+
+    uc := initUseCases(pg, jwtManager)
+    s := initServers(cfg, uc, jwtManager, l)
+    s.startServers()
+    s.waitForShutdown(l)
+}
