@@ -49,7 +49,7 @@ services:
 
   promtail:
     container_name: promtail
-    image: grafana/promtail:3.0.0
+    image: grafana/promtail:3.6.8
     volumes:
       - ./observability/promtail.yaml:/etc/promtail/config.yaml
       - /var/run/docker.sock:/var/run/docker.sock
